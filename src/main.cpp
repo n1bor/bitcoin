@@ -38,6 +38,7 @@
 #include "validationinterface.h"
 #include "versionbits.h"
 
+#include <inttypes.h>
 #include <atomic>
 #include <sstream>
 
@@ -4739,8 +4740,10 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
             {
                 bool send = false;
                 BlockMap::iterator mi = mapBlockIndex.find(inv.hash);
+                int nHeight = 0;
                 if (mi != mapBlockIndex.end())
                 {
+                    nHeight = mi->second->nHeight;
                     if (chainActive.Contains(mi->second)) {
                         send = true;
                     } else {
@@ -4775,9 +4778,17 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
                     CBlock block;
                     if (!ReadBlockFromDisk(block, (*mi).second, consensusParams))
                         assert(!"cannot load block from disk");
-                    if (inv.type == MSG_BLOCK)
+                    LogPrint("net", "sending regular %s (%d) to peer=%d\n", inv.ToString(), nHeight, pfrom->id);
+                    
+                    if (inv.type == MSG_BLOCK){
+                        CNodeStats stats;
+                        pfrom->copyStats(stats);
+                        uint64_t sendBefore=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
                         pfrom->PushMessageWithFlag(SERIALIZE_TRANSACTION_NO_WITNESS, NetMsgType::BLOCK, block);
-                    else if (inv.type == MSG_WITNESS_BLOCK)
+                        pfrom->copyStats(stats);
+                        uint64_t sendAfter=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
+                        LogPrintf("sending regular block bytes: %" PRIu64 " height: %d\n", sendAfter-sendBefore,nHeight);    
+                    } else if (inv.type == MSG_WITNESS_BLOCK)
                         pfrom->PushMessage(NetMsgType::BLOCK, block);
                     else if (inv.type == MSG_FILTERED_BLOCK)
                     {
@@ -4806,12 +4817,29 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
                         // and we don't feel like constructing the object for them, so
                         // instead we respond with the full, non-compact block.
                         if (mi->second->nHeight >= chainActive.Height() - 10) {
+                            CNodeStats stats;
+                            pfrom->copyStats(stats);
+                            uint64_t sendBefore=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
+                            
                             CBlockHeaderAndShortTxIDs cmpctblock(block);
                             pfrom->PushMessageWithFlag(SERIALIZE_TRANSACTION_NO_WITNESS, NetMsgType::CMPCTBLOCK, cmpctblock);
-                        } else
+                            
+                            pfrom->copyStats(stats);
+                            uint64_t sendAfter=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
+                            LogPrintf("sending regular blockcpkt bytes: %" PRIu64 " height: %d\n", sendAfter-sendBefore,nHeight); 
+                        } else {
+                            CNodeStats stats;
+                            pfrom->copyStats(stats);
+                            uint64_t sendBefore=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
                             pfrom->PushMessageWithFlag(SERIALIZE_TRANSACTION_NO_WITNESS, NetMsgType::BLOCK, block);
+                            pfrom->copyStats(stats);
+                            uint64_t sendAfter=stats.mapSendBytesPerMsgCmd[std::string(NetMsgType::BLOCK)];
+                            LogPrintf("sending regular blockhead bytes: %" PRIu64 " height: %d\n", sendAfter-sendBefore,nHeight); 
+                        }
                     }
-
+                    
+                    
+                    
                     // Trigger the peer node to send a getblocks request for the next batch of inventory
                     if (inv.hash == pfrom->hashContinue)
                     {
