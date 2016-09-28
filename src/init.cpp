@@ -163,7 +163,7 @@ public:
     // Writes do not need similar protection, as failure to write is handled by the caller.
 };
 
-static CCoinsViewDB *pcoinsdbview = NULL;
+
 static CCoinsViewErrorCatcher *pcoinscatcher = NULL;
 static std::unique_ptr<ECCVerifyHandle> globalVerifyHandle;
 
@@ -1409,6 +1409,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
         }
     }
 
+
     // As LoadBlockIndex can take several minutes, it's possible the user
     // requested to kill the GUI during the last operation. If so, exit.
     // As the program has not fully started yet, Shutdown() is possibly overkill.
@@ -1500,8 +1501,22 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
         pwalletMain->ReacceptWalletTransactions();
 #endif
 
-    // ********************************************************* Step 11: start node
-
+    // ********************************************************* Step 11: add scheduled update of snapshots
+    
+    scheduler.scheduleEvery(boost::bind(&CCoinsViewDB::UpdateAllSnapshots,pcoinsdbview),60);
+    //TODO replace magic 60!
+    
+    LogPrintf("ChainActive height %d\n",chainActive.Height());
+    LogPrint("net","net logging active\n");
+    LogPrint("snapshot","snapshot logging active\n");
+    LogPrint("chaindownload","chaindownload logging active\n");
+    
+    if(chainActive.Height()==0){
+        //TODO and option to disable.
+        LogPrintf("ChainActive height 0 so starting chainstate download.\n");
+        chainDownloadStatus.state=CChainDownloadStatus::GETTING_HEADERS;
+    }
+    // ********************************************************* Step 12: start node
     //// debug print
     LogPrintf("mapBlockIndex.size() = %u\n",   mapBlockIndex.size());
     LogPrintf("nBestHeight = %d\n",                   chainActive.Height());

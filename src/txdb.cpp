@@ -9,7 +9,7 @@
 #include "hash.h"
 #include "pow.h"
 #include "uint256.h"
-
+#include "sync.h"
 #include <stdint.h>
 
 #include <boost/thread.hpp>
@@ -26,7 +26,6 @@ static const char DB_FLAG = 'F';
 static const char DB_REINDEX_FLAG = 'R';
 static const char DB_LAST_BLOCK = 'l';
 
-
 CCoinsViewDB::CCoinsViewDB(size_t nCacheSize, bool fMemory, bool fWipe) : db(GetDataDir() / "chainstate", nCacheSize, fMemory, fWipe, true) 
 {
 }
@@ -40,8 +39,15 @@ bool CCoinsViewDB::HaveCoins(const uint256 &txid) const {
 }
 
 uint256 CCoinsViewDB::GetBestBlock() const {
+    CChainSnapshot s;
+    s.snapshotId=-1;
+    return GetBestBlock(&s);
+}
+
+uint256 CCoinsViewDB::GetBestBlock(CChainSnapshot* const snapshot) const {
     uint256 hashBestChain;
-    if (!db.Read(DB_BEST_BLOCK, hashBestChain))
+    
+    if (!db.Read(DB_BEST_BLOCK, hashBestChain,snapshot->snapshotId))
         return uint256();
     return hashBestChain;
 }
@@ -67,6 +73,208 @@ bool CCoinsViewDB::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) {
 
     LogPrint("coindb", "Committing %u changed transactions (out of %u) to coin database...\n", (unsigned int)changed, (unsigned int)count);
     return db.WriteBatch(batch);
+}
+
+int CCoinsViewDB::CreateSnapshot() {
+    int snapshotId=db.GetSnapsnot();
+    CChainSnapshot *ss=new CChainSnapshot();
+    ss->snapshotId=snapshotId;
+    snapshots.push_back(ss);
+    LogPrintf("snapshotted\n");
+    return snapshotId;
+}
+
+std::pair<std::vector<CChainSnapshot*>::iterator, 
+          std::vector<CChainSnapshot*>::iterator> CCoinsViewDB::GetAllSnapshots(){
+    return std::make_pair(snapshots.begin(), snapshots.end());
+}
+
+bool CCoinsViewDB::UpdateAllSnapshots(){
+    LogPrint("snapshot","UpdateAllSnapshots started.\n"); 
+    for(CChainSnapshot* const snapshot: snapshots) {
+        if(!snapshot->updated && !snapshot->updating){
+            //do 1st in naive, but probably OK attempt to avoid races.
+            snapshot->updating=true;
+            //needs updating all the data
+            
+            snapshot->blockHash=GetBestBlock(snapshot);
+ 
+            std::unique_ptr<CCoinsViewCursor> pcursor(Cursor(*snapshot));
+            CHashWriter ss(SER_GETHASH, PROTOCOL_VERSION);
+            CHashWriter ss2(SER_GETHASH, PROTOCOL_VERSION);
+            uint64_t count=0;
+            uint64_t outputs=0;
+            uint64_t size=0;
+
+            CAmount nTotalAmount = 0;
+            int splits=0;
+            arith_uint256 oldKeyShifted("0");
+            ss<<splits;
+            while (pcursor->Valid() ) {
+                boost::this_thread::interruption_point();
+                uint256 key;
+                CCoins coins;
+                if (pcursor->GetKey(key) && pcursor->GetValue(coins)) {
+                    //LogPrintf("split %d Tx %s\n",splits,key.ToString());
+                    arith_uint256 key2 = UintToArith256(key);
+                    arith_uint256 byte1=(key2<<248)>>240;
+                    arith_uint256 byte2=((key2<<240)>>248);
+                    // 2bytes to 65k combinations. Want 8k chunks so need
+                    // to lose 3 bits.
+                    arith_uint256 keySwitched=byte1+byte2;
+                    //LogPrintf("%s %s %s %s\n",key2.ToString(),
+                    //        byte1.ToString(),byte2.ToString(),keySwitched.ToString());
+                    
+                    while(splits != keySwitched>>3){
+                        //We need to restart hashing
+                        uint256 chunkhash=ss.GetHash();
+                        snapshot->mapChunkHash.insert(make_pair(chunkhash,splits));
+                        ss2<<chunkhash;
+                        //LogPrintf("HASH [%s]\n",chunkhash.ToString());
+                        ss.Reset();
+                        splits++;
+                        ss<<splits;
+                    }
+                    count++;
+                    //This is cut/paste from existing utxo code.
+                    //assume correct! Needs checking. If this wrong
+                    //attacher could make coins even though hash
+                    //matched
+                    ss << key;
+                    for (unsigned int i=0; i<coins.vout.size(); i++) {
+                        const CTxOut &out = coins.vout[i];
+                        if (!out.IsNull()) {
+                            outputs++;
+                            ss << VARINT(i+1);
+                            ss << out;
+                            nTotalAmount += out.nValue;
+                        }
+                    }
+                    size += 32 + pcursor->GetValueSize();
+                    
+                    ss << VARINT(0);
+                } else {
+                    return error("%s: unable to read value", __func__);
+                }
+                pcursor->Next();
+
+            }
+            uint256 chunkhash=ss.GetHash();
+            snapshot->mapChunkHash.insert(make_pair(chunkhash,splits));
+            ss2<<chunkhash;
+            //LogPrintf("HASH [%s]\n",chunkhash.ToString());
+            
+            
+            snapshot->chainStateHash=ss2.GetHash();
+            snapshot->updated=true;
+            snapshot->updating=false;
+            LogPrint("snapshot","snapshot with %u splits, %u tx, %u utxos,  %u bytes, chainhash %s\n",
+                    (unsigned int)splits,(unsigned int)count,
+                    (unsigned int)outputs,(unsigned int)size,
+                    snapshot->chainStateHash.ToString());
+            
+        }
+        
+    
+    }
+    LogPrint("snapshot","UpdateAllSnapshots ran.\n"); 
+    return true;
+    
+}
+
+std::vector<std::pair<uint256,CCoins>> CCoinsViewDB::GetChunk(uint256 chainStateHash,
+        uint256 chunkHash){
+
+    std::vector<std::pair<uint256,CCoins>> data;
+    
+    for(CChainSnapshot* const snapshot: snapshots) {
+        //TODO add in validated once miners start mining!
+        if(true  || (snapshot->updated && !snapshot->updating)){  
+            if(snapshot->chainStateHash==chainStateHash){
+                LogPrint("chaindownload","Found Chainstate.\n");
+                //Have match so process
+                std::map<uint256,int>::iterator it=snapshot->mapChunkHash.find(chunkHash);
+                if(it==snapshot->mapChunkHash.end()){
+                    LogPrint("chaindownload","Chunk not found.\n");
+                } else {
+                    // we found it
+                    int chunkId=it->second;
+                    // now hard bit - working out the 1st possible transactionID!
+                    arith_uint256 raw=(uint64_t)chunkId;
+                    
+                    raw=raw<<3;
+                    arith_uint256 byte1=(raw<<248)>>240;
+                    arith_uint256 byte2=(raw>>8);
+                    arith_uint256 firstTx=byte1+byte2;
+
+                    LogPrint("chaindownload","start %s.\n",firstTx.ToString());
+                    
+                    std::unique_ptr<CCoinsViewCursor> pcursor(Cursor(*snapshot,ArithToUint256(firstTx)));
+                    int txCount=0;
+                    while (pcursor->Valid() ) {
+                        boost::this_thread::interruption_point();
+                        uint256 key;
+                        CCoins coins;
+                        if (pcursor->GetKey(key) && pcursor->GetValue(coins)) {
+                            //LogPrintf("got tx Tx %s\n",key.ToString());
+                            //This shuffling is cos leveldb seens to sort with
+                            //wrong endian - fix is this.
+                            arith_uint256 key2 = UintToArith256(key);
+                            arith_uint256 byte1=(key2<<248)>>240;
+                            arith_uint256 byte2=((key2<<240)>>248);
+                            // 2bytes so 64k combinations. Want 8k chunks so need
+                            // to lose 3 bits.
+                            arith_uint256 keySwitched=byte1+byte2;
+                            keySwitched=keySwitched>>3;
+                            int id=keySwitched.GetLow64();
+                            //LogPrintf("%s %s %s %s\n",key2.ToString(),
+                            //        byte1.ToString(),byte2.ToString(),keySwitched.ToString());
+                            
+                            if(id != chunkId){
+                                
+                                LogPrint("chaindownload"," break id %d Tx %s\n",id,key.ToString());
+                                break;
+                            }
+                            ++txCount;
+                            data.push_back(make_pair(key,coins));
+                        } else {
+                            LogPrintf("%s: unable to read value", __func__);
+                            return data;
+                        }
+                        pcursor->Next();
+
+                    }
+                    LogPrint("chaindownload","end of database tx=%d\n",txCount);
+                }
+                return data;
+            }
+        }  
+    }
+    
+    
+    return data;
+}
+
+
+void CCoinsViewDB::KeepLastNSnapshots(int n){
+    // this is very bad logic! TODO tidy up!
+    for (unsigned i=snapshots.size()-n-1; i<snapshots.size(); --i) {
+        LogPrint("snapshot","Deleting snapshot %d\n",i);
+        DeleteSnapshot(snapshots[i]->snapshotId);
+    }   
+}
+
+bool CCoinsViewDB::DeleteSnapshot(int id){
+    
+    for (unsigned i=0; i<snapshots.size(); ++i) {
+        if(snapshots[i]->snapshotId==id){
+            db.ReleaseSnapshot(id);
+            delete snapshots[i];
+            snapshots.erase(snapshots.begin()+i);
+            return true;
+        }
+    }
+    return false;
 }
 
 CBlockTreeDB::CBlockTreeDB(size_t nCacheSize, bool fMemory, bool fWipe) : CDBWrapper(GetDataDir() / "blocks" / "index", nCacheSize, fMemory, fWipe) {
@@ -99,6 +307,30 @@ CCoinsViewCursor *CCoinsViewDB::Cursor() const
        only need read operations on it, use a const-cast to get around
        that restriction.  */
     i->pcursor->Seek(DB_COINS);
+    // Cache key of first record
+    i->pcursor->GetKey(i->keyTmp);
+    return i;
+}
+
+CCoinsViewCursor *CCoinsViewDB::Cursor(const CChainSnapshot &snapshot) const
+{
+    CCoinsViewDBCursor *i = new CCoinsViewDBCursor(const_cast<CDBWrapper*>(&db)->NewIterator(snapshot.snapshotId), GetBestBlock());
+    /* It seems that there are no "const iterators" for LevelDB.  Since we
+       only need read operations on it, use a const-cast to get around
+       that restriction.  */
+    i->pcursor->Seek(DB_COINS);
+    // Cache key of first record
+    i->pcursor->GetKey(i->keyTmp);
+    return i;
+}
+
+CCoinsViewCursor *CCoinsViewDB::Cursor(const CChainSnapshot &snapshot,uint256 txid) const
+{
+    CCoinsViewDBCursor *i = new CCoinsViewDBCursor(const_cast<CDBWrapper*>(&db)->NewIterator(snapshot.snapshotId), GetBestBlock());
+    /* It seems that there are no "const iterators" for LevelDB.  Since we
+       only need read operations on it, use a const-cast to get around
+       that restriction.  */
+    i->pcursor->Seek(make_pair(DB_COINS, txid));
     // Cache key of first record
     i->pcursor->GetKey(i->keyTmp);
     return i;
@@ -212,4 +444,14 @@ bool CBlockTreeDB::LoadBlockIndexGuts(boost::function<CBlockIndex*(const uint256
     }
 
     return true;
+}
+
+std::string CChunkData::ToString() const
+{
+    std::stringstream s;
+    s << strprintf("CChunkData(hashChainChunks=%s, hashChunk=%s, txCount=%d)\n",
+        hashChainChunks.ToString(),
+        hashChunk.ToString(),
+        vTxCoins.size());
+    return s.str();
 }

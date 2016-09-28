@@ -10,6 +10,7 @@
 #include "serialize.h"
 #include "uint256.h"
 
+
 /** Nodes collect new transactions into a block, hash them into a hash tree,
  * and scan through nonce values to make the block's hash satisfy proof-of-work
  * requirements.  When they solve the proof-of-work, they broadcast the block
@@ -156,5 +157,112 @@ struct CBlockLocator
 
 /** Compute the consensus-critical block weight (see BIP 141). */
 int64_t GetBlockWeight(const CBlock& tx);
+
+class CSnapshotData
+{
+public:
+    // header
+    uint256 hashHeadBlock;
+    uint256 hashChainChunks;
+    uint32_t countChunks;
+    std::vector<uint256> vChunkHashes;
+
+    CSnapshotData()
+    {
+        SetNull();
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(hashHeadBlock);
+        READWRITE(hashChainChunks);
+        READWRITE(countChunks);
+        READWRITE(vChunkHashes);
+        
+    }
+
+    void SetNull()
+    {
+        hashHeadBlock.SetNull();
+        hashChainChunks.SetNull();
+        countChunks = 0;
+        vChunkHashes.clear();
+    }
+
+    bool IsNull() const
+    {
+        return (countChunks == 0);
+    }
+    
+    std::string ToString() const;
+};
+
+class CChunkRequestData
+{
+public:
+    // header
+    uint256 hashChainChunks;
+    uint256 hashChunk;
+
+    CChunkRequestData()
+    {
+        SetNull();
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(hashChainChunks);
+        READWRITE(hashChunk);
+    }
+
+    void SetNull()
+    {
+        hashChainChunks.SetNull();
+        hashChunk.SetNull();
+    }
+
+    std::string ToString() const;
+};
+/**
+class CChunkData
+{
+public:
+    // header
+    uint256 hashChainChunks;
+    uint256 hashChunk;
+    std::vector<std::pair<uint256,CCoins>> vTxCoins;
+    CChunkData()
+    {
+        SetNull();
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(hashChainChunks);
+        READWRITE(hashChunk);
+        READWRITE(vTxCoins);
+        
+    }
+
+    void SetNull()
+    {
+        hashChainChunks.SetNull();
+        hashChunk.SetNull();
+        vTxCoins.clear();
+    }
+    
+    bool IsNull() const
+    {
+        return (vTxCoins.size() == 0);
+    }
+
+    std::string ToString() const;
+};*/
 
 #endif // BITCOIN_PRIMITIVES_BLOCK_H

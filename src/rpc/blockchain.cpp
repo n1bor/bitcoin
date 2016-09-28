@@ -19,6 +19,7 @@
 #include "util.h"
 #include "utilstrencodings.h"
 #include "hash.h"
+#include "txdb.h"
 
 #include <stdint.h>
 
@@ -814,6 +815,171 @@ static bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
     return true;
 }
 
+UniValue createsnapshot(const JSONRPCRequest& request)
+{
+    UniValue params=request.params;
+    if (request.fHelp || params.size() != 0)
+        throw runtime_error(
+            "createsnapshot\n"
+            "\nWhen called creates snapshot of chainstate.\n"
+        );
+    FlushStateToDisk();
+    UniValue ret(UniValue::VOBJ);
+    int id=pcoinsdbview->CreateSnapshot();
+    ret.push_back(Pair("SnapshotId",id));
+    return ret;
+}
+
+UniValue updateallsnapshots(const JSONRPCRequest& request)
+{
+    UniValue params=request.params;
+    if (request.fHelp || params.size() != 0)
+        throw runtime_error(
+            "updateallsnapshots\n"
+            "\nWhen called hashes chainstate for all snapshots\n"
+            "and stores results.\n"
+            "Should never need this as scheduled every minute\n"
+        );
+    
+    UniValue ret(UniValue::VOBJ);
+    bool retVal=pcoinsdbview->UpdateAllSnapshots();
+    ret.push_back(Pair("Success",retVal));
+    return ret;
+}
+
+
+
+UniValue listsnapshots(const JSONRPCRequest& request)
+{
+    UniValue params=request.params;
+    if (request.fHelp || params.size() > 1)
+        throw runtime_error(
+            "listsnapshots\n"
+            "\nOuputs info on all the available snapshots.\n"
+            "\nArguments:\n"
+            "1. \"all\"       (string, optional) If added then all chucks output\n"
+            "otherwise just the 1st 5.\n"
+        );
+    int count=5;
+    if(params.size()==1)
+        count=100000000;
+    
+    UniValue ret(UniValue::VOBJ);
+
+    
+    std::pair<std::vector<CChainSnapshot*>::iterator, 
+          std::vector<CChainSnapshot*>::iterator> p = pcoinsdbview->GetAllSnapshots();
+
+    for (std::vector<CChainSnapshot*>::iterator it=p.first; it != p.second; ++it){
+        CChainSnapshot *s=*it;
+        UniValue snapshotData(UniValue::VOBJ);
+        snapshotData.push_back(Pair("ID",             s->snapshotId));
+        snapshotData.push_back(Pair("BestBlockHash",  s->blockHash.ToString()));
+        snapshotData.push_back(Pair("chainStateHash",     s->chainStateHash.ToString()));
+        snapshotData.push_back(Pair("validated",     s->validated));
+        snapshotData.push_back(Pair("updated",     s->updated));
+        snapshotData.push_back(Pair("updating",     s->updating));
+        UniValue jsonArray(UniValue::VARR);
+        
+        std::map<int,uint256> sortedMapChunkHash;
+        
+        for(auto const& pair: s->mapChunkHash) {
+            sortedMapChunkHash.insert(make_pair(pair.second,pair.first));
+        }
+        int numberOutput=0;
+        for(auto const& pair: sortedMapChunkHash) {
+            UniValue chunkData(UniValue::VOBJ);
+            chunkData.push_back(Pair("id",pair.first));
+            chunkData.push_back(Pair("hash",pair.second.ToString()));
+            jsonArray.push_back(chunkData);
+            
+            ++numberOutput;
+            if(numberOutput>=count) {
+                UniValue andMore(UniValue::VOBJ);
+                andMore.push_back(Pair("truncated...","use parameter all to get all chunks....."));
+                jsonArray.push_back(andMore);
+                break;
+            }
+            
+        }
+        snapshotData.push_back(Pair("Chunks",jsonArray));
+        ret.push_back(Pair("snapshotData",            snapshotData));
+    }
+
+    return ret;
+    
+}
+
+UniValue deletesnapshot(const JSONRPCRequest& request)
+{
+    UniValue params=request.params;
+    if (request.fHelp || params.size() != 1)
+        throw runtime_error(
+            "deletesnapshot ( snapshotid )\n"
+            "\nDeletes an existing snapshot of chainstate database.\n"
+            "\nArguments:\n"
+            "1. \"snapshotid\"       (int, required) The id of snapshot from listsnapshots\n"
+            + HelpExampleCli("deletesnapshot", "1")
+        );
+    int n = params[0].get_int();
+    bool retValue=pcoinsdbview->DeleteSnapshot(n);
+    
+    UniValue ret(UniValue::VOBJ);
+    ret.push_back(Pair("returned",retValue));
+    return ret;
+}
+
+UniValue getchunk(const JSONRPCRequest& request)
+{
+    UniValue params=request.params;
+    if (request.fHelp || params.size() != 2)
+        throw runtime_error(
+            "getchunk\n"
+            "\nOuputs a chunk and checks hash.\n"
+            "\nArguments:\n"
+            "1. \"chainstatehash\"       (string) hash of chain state\n"
+            "2. \"chunkhash\"            (string) hash of chunk to get\n"
+            
+        );
+    
+    std::string strHash = params[0].get_str();
+    uint256 chainstatehash(uint256S(strHash));
+    strHash = params[1].get_str();
+    uint256 chunkhash(uint256S(strHash));
+    
+    std::vector<std::pair<uint256,CCoins>> chunk=
+            pcoinsdbview->GetChunk(chainstatehash,chunkhash);
+    
+    UniValue result(UniValue::VOBJ);
+    
+    UniValue jsonArray(UniValue::VARR);
+    
+    
+    CHashWriter ss(SER_GETHASH, PROTOCOL_VERSION);
+    
+    for(auto const& pair: chunk) {
+        //UniValue chunkData(UniValue::VOBJ);
+        //chunkData.push_back(Pair("id",pair.first));
+        jsonArray.push_back(pair.first.ToString());
+        
+        ss << pair.first;
+        CCoins coins=pair.second;
+        
+        for (unsigned int i=0; i<coins.vout.size(); i++) {
+            const CTxOut &out = coins.vout[i];
+            if (!out.IsNull()) {
+                ss << VARINT(i+1);
+                ss << out;
+            }
+        }
+        ss << VARINT(0);
+    }
+    result.push_back(Pair("Txs",jsonArray));
+    result.push_back(Pair("count", chunk.size()));
+    result.push_back(Pair("CalcChunkHash",ss.GetHash().ToString()));
+    return result;
+}
+
 UniValue gettxoutsetinfo(const JSONRPCRequest& request)
 {
     if (request.fHelp || request.params.size() != 0)
@@ -1383,6 +1549,11 @@ static const CRPCCommand commands[] =
     { "blockchain",         "getmempoolinfo",         &getmempoolinfo,         true  },
     { "blockchain",         "getrawmempool",          &getrawmempool,          true  },
     { "blockchain",         "gettxout",               &gettxout,               true  },
+    { "blockchain",         "createsnapshot",         &createsnapshot,         true  },
+    { "blockchain",         "listsnapshots",          &listsnapshots,          true  },
+    { "blockchain",         "deletesnapshot",         &deletesnapshot,         true  },
+    { "blockchain",         "updateallsnapshots",     &updateallsnapshots,     true  },
+    { "blockchain",         "getchunk",               &getchunk,               true  },
     { "blockchain",         "gettxoutsetinfo",        &gettxoutsetinfo,        true  },
     { "blockchain",         "verifychain",            &verifychain,            true  },
 

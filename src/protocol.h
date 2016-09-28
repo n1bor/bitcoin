@@ -240,6 +240,28 @@ extern const char *GETBLOCKTXN;
  * @since protocol version 70014 as described by BIP 152
  */
 extern const char *BLOCKTXN;
+/**
+ * Is a request for a CSnapshotData.
+ * @since protocol version XXXX as described by BIP YYYY
+ */
+extern const char *GETSNAPSHOT;
+/**
+ * Contains a CSnapshotData.
+ * Sent in response to a "getsnapshot" message.
+ * @since protocol version XXXX as described by BIP YYYY
+ */
+extern const char *SNAPSHOT;
+/**
+ * Is a request for a CChunkData.
+ * @since protocol version XXXX as described by BIP YYYY
+ */
+extern const char *GETCHUNK;
+/**
+ * Contains a CChunkData.
+ * Sent in response to a "getchunk" message.
+ * @since protocol version XXXX as described by BIP YYYY
+ */
+extern const char *CHUNK;
 };
 
 /* Get a vector of all valid message types (see above) */

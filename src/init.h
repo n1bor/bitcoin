@@ -10,7 +10,7 @@
 
 class CScheduler;
 class CWallet;
-
+class CChainDownloadStatus;
 namespace boost
 {
 class thread_group;

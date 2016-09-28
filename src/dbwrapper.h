@@ -172,7 +172,10 @@ private:
 
     //! the database itself
     leveldb::DB* pdb;
-
+    
+    std::map<int,const leveldb::Snapshot*> snapshots;
+    int nextSnapshotId;
+    
     //! a key used for optional XOR-obfuscation of the database
     std::vector<unsigned char> obfuscate_key;
 
@@ -199,13 +202,25 @@ public:
     template <typename K, typename V>
     bool Read(const K& key, V& value) const
     {
+        return Read(key,value, -1);
+    }
+    
+    template <typename K, typename V>
+    bool Read(const K& key, V& value, int snapshotId) const
+    {
+        leveldb::ReadOptions currentOptions;
+        currentOptions.verify_checksums = true;
+        currentOptions.fill_cache = false;
+        if(snapshotId != -1)
+            currentOptions.snapshot=snapshots.at(snapshotId);
+        
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(ssKey.GetSerializeSize(key));
         ssKey << key;
         leveldb::Slice slKey(&ssKey[0], ssKey.size());
 
         std::string strValue;
-        leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
+        leveldb::Status status = pdb->Get(currentOptions, slKey, &strValue);
         if (!status.ok()) {
             if (status.IsNotFound())
                 return false;
@@ -275,7 +290,40 @@ public:
     {
         return new CDBIterator(*this, pdb->NewIterator(iteroptions));
     }
-
+    
+    int GetSnapsnot(){
+        leveldb::ReadOptions options;
+        options.snapshot = pdb->GetSnapshot();
+        int id=nextSnapshotId++;
+        snapshots.insert(std::make_pair(id, options.snapshot));
+        return id;  
+    }
+    
+    bool ReleaseSnapshot(int snapshotId){
+        //Need to do this to allow leveldb to compact.
+        //Else chainstate will just keep growing!
+        if ( snapshots.find(snapshotId) == snapshots.end() ) {
+            // not found
+            return false;
+        } else {
+            
+            pdb->ReleaseSnapshot(snapshots[snapshotId]);
+            snapshots.erase(snapshotId);
+            // found
+            return true;
+        }
+    }
+    
+    CDBIterator *NewIterator(int snapshotId)
+    {
+        leveldb::ReadOptions snapshotOptions;
+        snapshotOptions.verify_checksums = true;
+        snapshotOptions.fill_cache = false;
+        snapshotOptions.snapshot=snapshots[snapshotId];
+        return new CDBIterator(*this, pdb->NewIterator(snapshotOptions));
+    }
+    
+    
     /**
      * Return true if the database managed by this class contains no entries.
      */

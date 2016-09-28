@@ -40,3 +40,30 @@ int64_t GetBlockWeight(const CBlock& block)
     // weight = (stripped_size * 3) + total_size.
     return ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
 }
+
+std::string CSnapshotData::ToString() const
+{
+    std::stringstream s;
+    s << strprintf("CSnapshotData(hashHead=%s, hashChainChunks=%s, countChunks=%u, vChunkHashes.size()=%u)\n",
+        hashHeadBlock.ToString(),
+        hashChainChunks.ToString(),
+        countChunks,
+        vChunkHashes.size());
+    for (unsigned int i = 0; i < vChunkHashes.size(); i++)
+    {
+        if(i<5 || i>8180)
+            s << "  " << vChunkHashes[i].ToString() << "\n";
+        if(i==5)
+            s<<"...\n...\n...\n";
+    }
+    return s.str();
+}
+
+std::string CChunkRequestData::ToString() const
+{
+    std::stringstream s;
+    s << strprintf("CChunkRequestData(hashChainChunks=%s, hashChunk=%s)\n",
+        hashChainChunks.ToString(),
+        hashChunk.ToString());
+    return s.str();
+}

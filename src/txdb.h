@@ -61,9 +61,45 @@ struct CDiskTxPos : public CDiskBlockPos
     }
 };
 
+class CChainSnapshot
+{
+public:
+        //! Store snapshots
+    int snapshotId; 
+    uint256 blockHash; //Hash of block at tip when snapshot taken
+    uint256 chainStateHash; //simple hash of chunk hashes.
+    std::map<uint256,int> mapChunkHash; //Hash of each chunk and id.
+    //id is which of the 8129 chucks it is so we can index straight into
+    //leveldb and get it.
+    bool updating; //Whether we are calculating the hash of hashes
+    bool updated; //Whether the hash of hashes has been calculated
+    bool validated; //Whether hash is in chain! Soft Fork needed!
+    
+    CChainSnapshot() :updating(false),updated(false),validated(false) {};
+    
+};
+
+class CChainDownloadStatus
+{
+public:
+    enum State { NONE, GETTING_HEADERS,
+                GETSNAPSHOT_SENT, GETTING_CHUNKS };
+    State state;
+    uint256 blockHash;
+    uint256 chainStateHash;
+    std::map<uint256,int> chunkHashIds;
+    std::vector<uint256> chunkHashes;
+    std::list<uint256> inflightChunks;
+    std::vector<uint256> receivedChunks;
+    
+    CChainDownloadStatus():state(CChainDownloadStatus::NONE) {};
+};
+
 /** CCoinsView backed by the coin database (chainstate/) */
 class CCoinsViewDB : public CCoinsView
 {
+private:
+    std::vector<CChainSnapshot*> snapshots;
 protected:
     CDBWrapper db;
 public:
@@ -72,8 +108,23 @@ public:
     bool GetCoins(const uint256 &txid, CCoins &coins) const;
     bool HaveCoins(const uint256 &txid) const;
     uint256 GetBestBlock() const;
+    uint256 GetBestBlock(CChainSnapshot* const snapshot) const;
     bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock);
     CCoinsViewCursor *Cursor() const;
+    int CreateSnapshot();
+    void KeepLastNSnapshots(int n);
+    bool DeleteSnapshot(int id);
+    CCoinsViewCursor *Cursor(const CChainSnapshot &snapshot) const;
+    CCoinsViewCursor *Cursor(const CChainSnapshot &snapshot,uint256 txid) const;
+    CChainSnapshot *GetLastSnapshot();
+    std::pair<std::vector<CChainSnapshot*>::iterator, 
+          std::vector<CChainSnapshot*>::iterator> GetAllSnapshots();
+    bool UpdateAllSnapshots();
+
+    std::vector<std::pair<uint256,CCoins>> GetChunk(uint256 chainStateHash,
+        uint256 chunkHash);
+    
+    
 };
 
 /** Specialization of CCoinsViewCursor to iterate over a CCoinsViewDB */
@@ -119,4 +170,40 @@ public:
     bool LoadBlockIndexGuts(boost::function<CBlockIndex*(const uint256&)> insertBlockIndex);
 };
 
+class CChunkData
+{
+public:
+    // header
+    uint256 hashChainChunks;
+    uint256 hashChunk;
+    std::vector<std::pair<uint256,CCoins>> vTxCoins;
+    CChunkData()
+    {
+        SetNull();
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(hashChainChunks);
+        READWRITE(hashChunk);
+        READWRITE(vTxCoins);
+        
+    }
+
+    void SetNull()
+    {
+        hashChainChunks.SetNull();
+        hashChunk.SetNull();
+        vTxCoins.clear();
+    }
+    
+    bool IsNull() const
+    {
+        return (vTxCoins.size() == 0);
+    }
+
+    std::string ToString() const;
+};
 #endif // BITCOIN_TXDB_H

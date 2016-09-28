@@ -34,6 +34,10 @@ FastRandomContext insecure_rand_ctx(true);
 extern bool fPrintToConsole;
 extern void noui_connect();
 
+// needed for leveldb snapshot release 
+// as this is now a global var, so we can snapshot from main.
+extern     CCoinsViewDB *pcoinsdbview; 
+
 BasicTestingSetup::BasicTestingSetup(const std::string& chainName)
 {
         ECC_Start();

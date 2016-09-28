@@ -156,6 +156,10 @@ public:
         ::Serialize(*this, obj, nType, nVersion);
         return (*this);
     }
+    
+    void Reset(){
+        ctx.Reset();
+    }
 };
 
 /** Compute the 256-bit hash of an object's serialization. */

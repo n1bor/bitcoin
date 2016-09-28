@@ -111,7 +111,7 @@ public:
         CONNECTIONS_OUT = (1U << 1),
         CONNECTIONS_ALL = (CONNECTIONS_IN | CONNECTIONS_OUT),
     };
-
+    
     struct Options
     {
         ServiceFlags nLocalServices = NODE_NONE;

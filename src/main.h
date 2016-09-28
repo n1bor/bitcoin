@@ -32,6 +32,7 @@
 
 class CBlockIndex;
 class CBlockTreeDB;
+class CCoinsViewDB;
 class CBloomFilter;
 class CChainParams;
 class CInv;
@@ -40,7 +41,7 @@ class CScriptCheck;
 class CTxMemPool;
 class CValidationInterface;
 class CValidationState;
-
+class CChainDownloadStatus;
 struct PrecomputedTransactionData;
 struct LockPoints;
 
@@ -184,6 +185,9 @@ extern bool fEnableReplacement;
 
 /** Best header we've seen so far (used for getheaders queries' starting points). */
 extern CBlockIndex *pindexBestHeader;
+
+// Track if we are doing a chainstate download rather that full blockchain download.
+extern CChainDownloadStatus chainDownloadStatus;
 
 /** Minimum disk space required - used in CheckDiskSpace() */
 static const uint64_t nMinDiskSpace = 52428800;
@@ -499,6 +503,7 @@ extern CChain chainActive;
 
 /** Global variable that points to the active CCoinsView (protected by cs_main) */
 extern CCoinsViewCache *pcoinsTip;
+extern CCoinsViewDB *pcoinsdbview;
 
 /** Global variable that points to the active block tree (protected by cs_main) */
 extern CBlockTreeDB *pblocktree;

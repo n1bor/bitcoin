@@ -81,6 +81,7 @@ uint64_t nPruneTarget = 0;
 int64_t nMaxTipAge = DEFAULT_MAX_TIP_AGE;
 bool fEnableReplacement = DEFAULT_ENABLE_REPLACEMENT;
 
+CChainDownloadStatus chainDownloadStatus;
 
 CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
 CAmount maxTxFee = DEFAULT_TRANSACTION_MAXFEE;
@@ -689,6 +690,7 @@ CBlockIndex* FindForkInGlobalIndex(const CChain& chain, const CBlockLocator& loc
 }
 
 CCoinsViewCache *pcoinsTip = NULL;
+CCoinsViewDB *pcoinsdbview = NULL; //Needed to take snapshots of db
 CBlockTreeDB *pblocktree = NULL;
 
 //////////////////////////////////////////////////////////////////////////////
@@ -2693,6 +2695,13 @@ void static UpdateTip(CBlockIndex *pindexNew, const CChainParams& chainParams) {
     std::vector<std::string> warningMessages;
     if (!IsInitialBlockDownload())
     {
+        if(chainActive.Height()%100==0){
+            FlushStateToDisk();
+            int id=pcoinsdbview->CreateSnapshot();
+            pcoinsdbview->KeepLastNSnapshots(3);
+            LogPrint("snapshot","%s: snapshot taken %d height %d\n",
+                    __func__,id,chainActive.Height());
+        }
         int nUpgraded = 0;
         const CBlockIndex* pindex = chainActive.Tip();
         for (int bit = 0; bit < VERSIONBITS_NUM_BITS; bit++) {
@@ -5283,8 +5292,245 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
         }
     }
+    else if (strCommand == NetMsgType::GETSNAPSHOT)
+    {
+        std::pair<std::vector<CChainSnapshot*>::iterator, 
+          std::vector<CChainSnapshot*>::iterator> p = pcoinsdbview->GetAllSnapshots();
+        
+        LogPrint("net", "got GETSNAPSHOT peer=%d\n",  pfrom->id);
+        
+        // reverse iteration using normal iterators!
+        for (auto it= p.second; it-- != p.first; ) {
+            
+            CChainSnapshot *s=*it;
+            if(!s->updated || s->updating){
+                //TODO add that it must be valid once mining!
+                LogPrint("net", "skipped snapshot at block %s as not valid id=%d\n"
+                        ,  s->blockHash.ToString(),s->snapshotId);
+                continue;
+            }
+            CSnapshotData snapshotMessage;
+            snapshotMessage.hashHeadBlock=s->blockHash;
+            snapshotMessage.hashChainChunks=s->chainStateHash;
+            snapshotMessage.countChunks=s->mapChunkHash.size();
+            std::map<int,uint256> sortedMapChunkHash;
+        
+            for(auto const& pair: s->mapChunkHash) {
+                sortedMapChunkHash.insert(make_pair(pair.second,pair.first));
+            }
+            for(auto const& pair: sortedMapChunkHash) {
+                snapshotMessage.vChunkHashes.push_back(pair.second);
+            }
+            
+            pfrom->PushMessage(NetMsgType::SNAPSHOT, snapshotMessage);
+            LogPrint("net", "pushed SNAPSHOT peer=%d\n",  pfrom->id);
+            LogPrint("net", "SNAPSHOT data=%s\n",  snapshotMessage.ToString());
+            break;
+        }
+    }
+    else if (strCommand == NetMsgType::SNAPSHOT)
+    {
+        LogPrint("net", "got SNAPSHOT peer=%d\n",  pfrom->id);
+        if(chainDownloadStatus.state==CChainDownloadStatus::GETSNAPSHOT_SENT){
+            CSnapshotData snapshotMessage;
+            vRecv>>snapshotMessage;
+            LogPrint("net", "got SNAPSHOT data=%s\n",  snapshotMessage.ToString());
+            chainDownloadStatus.blockHash=snapshotMessage.hashHeadBlock;
+            chainDownloadStatus.chainStateHash=snapshotMessage.hashChainChunks;
+            int id=0;
+            CHashWriter ss2(SER_GETHASH, PROTOCOL_VERSION);
+            for(auto chunk:snapshotMessage.vChunkHashes){
+                chainDownloadStatus.chunkHashes.push_back(chunk);
+                chainDownloadStatus.chunkHashIds.insert(make_pair(chunk,id));
+                ++id;
+                ss2<<chunk;
+                //LogPrintf("HASH [%s]\n",chunk.ToString());
+            }
+            
+            uint256 snapshotHash=ss2.GetHash();
+            LogPrint("net", "Message hash %s my hash %s\n",
+                    snapshotMessage.hashChainChunks.ToString(),
+                    snapshotHash.ToString());
+            
+            if(snapshotMessage.hashChainChunks!=snapshotHash){
+                LogPrint("net", "SNAPSHOT Message hash incorrect.\n");
+                return true;
+            }
+            
+            chainDownloadStatus.state=CChainDownloadStatus::GETTING_CHUNKS;
+            
+            //request 1st few chunks
+            for (auto it=chainDownloadStatus.chunkHashes.begin(); 
+                              it!=chainDownloadStatus.chunkHashes.end(); /*it++*/) {
+                if ( chainDownloadStatus.inflightChunks.size()
+                        >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                    // Can't download any more from this peer
+                    break;
+                }
+                uint256 hash=*it;
+                LogPrint("net", "Requesting chunk %s from  peer=%d\n",
+                            hash.ToString(), pfrom->id);
+                
+                CChunkRequestData chunkDataMessage;
+                chunkDataMessage.hashChainChunks=chainDownloadStatus.chainStateHash;
+                chunkDataMessage.hashChunk=hash;
+                pfrom->PushMessage(NetMsgType::GETCHUNK, chunkDataMessage);
+                
+                LogPrint("net", "pushed GETCHUNK peer=%d\n",  pfrom->id);
+                LogPrint("net", "GETCHUNK data=%s\n",  chunkDataMessage.ToString());
+                
+                //Add to inflight
+                chainDownloadStatus.inflightChunks.push_back(hash);
+                //Remove from needed list
+                it = chainDownloadStatus.chunkHashes.erase(it);
+            }
+        }
+    }
+    else if (strCommand == NetMsgType::GETCHUNK)
+    {
+        LogPrint("net", "got GETCHUNK peer=%d\n",  pfrom->id);
+        CChunkRequestData chunkDataMessage;
+        vRecv>>chunkDataMessage;
+        
+        std::vector<std::pair<uint256,CCoins>> chunk=
+            pcoinsdbview->GetChunk(chunkDataMessage.hashChainChunks,
+                chunkDataMessage.hashChunk);
+        
+        CChunkData chunkData;
+        chunkData.hashChainChunks=chunkDataMessage.hashChainChunks;
+        chunkData.hashChunk=chunkDataMessage.hashChunk;
+        
+        for(auto txpair:chunk){
+            chunkData.vTxCoins.push_back(txpair);
+        }
+        pfrom->PushMessage(NetMsgType::CHUNK, chunkData);
+        LogPrint("net", "pushed CHUNK peer=%d\n",  pfrom->id);
+        LogPrint("net", "CHUNK data=%s\n",  chunkData.ToString());
+    }
+    else if (strCommand == NetMsgType::CHUNK)
+    {
+        CChunkData chunkData;
+        vRecv>>chunkData;
+        LogPrint("net", "got CHUNK peer=%d data=%s\n",  
+                pfrom->id,
+                chunkData.ToString());
+        auto it=chainDownloadStatus.chunkHashIds.find(chunkData.hashChunk);
+        
+        if(it==chainDownloadStatus.chunkHashIds.end()){
+            LogPrint("net", "got unexpected CHUNK %s\n",
+                    chunkData.hashChunk.ToString());    
+            return true;
+        }
+        
+        int pos = (*it).second;
+        
+        LogPrint("net", "got CHUNK id=%d\n",pos);
+        CHashWriter ss(SER_GETHASH, PROTOCOL_VERSION);
+        ss<<pos;
+        
+        CCoinsMap m;
+        for(auto tx_pair:chunkData.vTxCoins){
+            CCoinsCacheEntry entry;
+            entry.coins=tx_pair.second;
+            entry.flags=CCoinsCacheEntry::DIRTY;
+            m.insert(std::make_pair(tx_pair.first,entry));
+            
+            ss << tx_pair.first;
+            for (unsigned int i=0; i<entry.coins.vout.size(); i++) {
+                const CTxOut &out = entry.coins.vout[i];
+                if (!out.IsNull()) {
+                    ss << VARINT(i+1);
+                    ss << out;
+                }
+            }
+            ss << VARINT(0);
+        }
+        
+        LogPrint("net", "got hash %s expected %s\n",ss.GetHash().ToString(),
+                chunkData.hashChunk.ToString());
+        
+        pcoinsdbview->BatchWrite(m,chainDownloadStatus.blockHash);
+        chainDownloadStatus.inflightChunks.remove(chunkData.hashChunk);
+        chainDownloadStatus.receivedChunks.push_back(chunkData.hashChunk);
+        
+        
+        //request next chunks
+        //TODO REFACTOR INTO FUNCTION!!
+        for (auto it=chainDownloadStatus.chunkHashes.begin(); 
+                          it!=chainDownloadStatus.chunkHashes.end(); /*it++*/) {
+            if ( chainDownloadStatus.inflightChunks.size()
+                    >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                // Can't download any more from this peer
+                break;
+            }
+            uint256 hash=*it;
+            LogPrint("net", "Requesting chunk %s from  peer=%d\n",
+                        hash.ToString(), pfrom->id);
 
+            CChunkRequestData chunkDataMessage;
+            chunkDataMessage.hashChainChunks=chainDownloadStatus.chainStateHash;
+            chunkDataMessage.hashChunk=hash;
+            pfrom->PushMessage(NetMsgType::GETCHUNK, chunkDataMessage);
 
+            LogPrint("net", "pushed GETCHUNK peer=%d\n",  pfrom->id);
+            LogPrint("net", "GETCHUNK data=%s\n",  chunkDataMessage.ToString());
+
+            //Add to inflight
+            chainDownloadStatus.inflightChunks.push_back(hash);
+            //Remove from needed list
+            it = chainDownloadStatus.chunkHashes.erase(it);
+        }
+        
+        if(chainDownloadStatus.chunkHashes.size()==0 && 
+                chainDownloadStatus.inflightChunks.size()==0){
+            //we are done!
+            LogPrint("net", "Chainstate downloaded from peer=%d\n",  pfrom->id);
+            //check hashes match!
+            CBlockIndex *block=pindexBestHeader;
+            std::vector<CBlockIndex*> vBlocks;
+            while(block->GetBlockHash()!=chainDownloadStatus.blockHash){
+                block=block->pprev;
+                //LogPrint("net", "back to block=%s\n",  block->ToString());
+            }
+            bool firstBlock=true;
+            do {
+                //LogPrint("net", "updating block=%s\n",  block->ToString());
+                vBlocks.push_back(block);
+                block->nStatus=5;
+                block->nChainTx=1; //TODO send in message
+                block->nTx=1; //TODO send in message
+                if(firstBlock){
+                    firstBlock=false;
+                    setBlockIndexCandidates.insert(block);
+                } else
+                    setBlockIndexCandidates.erase(block);
+                    
+                block=block->pprev;
+                if(block==nullptr){
+                    LogPrint("net", "Null block\n");
+                }
+            } while(block!=nullptr);
+            
+            for(unsigned i = vBlocks.size() - 1; vBlocks.size() > i; --i){
+                chainActive.SetTip(vBlocks[i]);   
+                //LogPrint("net", "settip block=%s\n",  vBlocks[i]->ToString());
+            }
+            pcoinsTip->SetBestBlock(chainDownloadStatus.blockHash);
+            fHavePruned=true;
+            pblocktree->WriteFlag("prunedblockfiles",true);
+            FlushStateToDisk();
+            chainDownloadStatus.state=CChainDownloadStatus::NONE;
+            
+        } else {
+            LogPrint("net", "Chainstate progress todo:%d inflight:%d done:%d\n",
+                    chainDownloadStatus.chunkHashes.size(),
+                    chainDownloadStatus.inflightChunks.size(),
+                    chainDownloadStatus.receivedChunks.size());
+        }
+        
+        
+        
+    }
     else if (strCommand == NetMsgType::INV)
     {
         vector<CInv> vInv;
@@ -5953,6 +6199,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             // from there instead.
             LogPrint("net", "more getheaders (%d) to end to peer=%d (startheight:%d)\n", pindexLast->nHeight, pfrom->id, pfrom->nStartingHeight);
             pfrom->PushMessage(NetMsgType::GETHEADERS, chainActive.GetLocator(pindexLast), uint256());
+        } else {
+            //move from getting headers to getting the snapshot.
+            if(chainDownloadStatus.state==CChainDownloadStatus::GETTING_HEADERS){
+                LogPrint("net","Got headers - sending GETSNAPSHOT\n");
+                pfrom->PushMessage(NetMsgType::GETSNAPSHOT);
+                chainDownloadStatus.state=CChainDownloadStatus::GETSNAPSHOT_SENT;
+            }
         }
 
         bool fCanDirectFetch = CanDirectFetch(chainparams.GetConsensus());
@@ -6837,7 +7090,7 @@ bool SendMessages(CNode* pto, CConnman& connman)
         // Message: getdata (blocks)
         //
         vector<CInv> vGetData;
-        if (!pto->fDisconnect && !pto->fClient && (fFetch || !IsInitialBlockDownload()) && state.nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        if (chainDownloadStatus.state==CChainDownloadStatus::NONE && !pto->fDisconnect && !pto->fClient && (fFetch || !IsInitialBlockDownload()) && state.nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             vector<CBlockIndex*> vToDownload;
             NodeId staller = -1;
             FindNextBlocksToDownload(pto->GetId(), MAX_BLOCKS_IN_TRANSIT_PER_PEER - state.nBlocksInFlight, vToDownload, staller, consensusParams);
